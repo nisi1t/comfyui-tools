@@ -8,13 +8,16 @@ Run this script from the ComfyUI portable root folder:
 Author: Nisipeanu Mihai/
 Github: https://github.com/nisi1t/comfyui-tools
 
+Add --debug to see per-node detail for every workflow:
+
+    python scan_comfyui_models.py --debug
+
 Output JSON structure
 ---------------------
 {
   "workflow_models": {
     "loras": [
-      { "filename": "Qwen-image_edit.safetensors", "found": true,  "used_in": ["my_workflow.json"] },
-      { "filename": "missing_lora.safetensors",    "found": false, "used_in": ["other.json"] }
+      { "filename": "Qwen-image_edit.safetensors", "found": true,  "used_in": ["subfolder/my_workflow.json"] }
     ],
     "diffusion_models": [
       { "filename": "flux1-fill-dev.safetensors",  "found": true,  "used_in": ["flux.json"] }
@@ -60,13 +63,8 @@ MODEL_EXTENSIONS = {
 # ---------------------------------------------------------------------------
 
 def build_models_on_disk(models_dir: Path):
-    """
-    Returns:
-      by_key      : { "loras/file.safetensors": Path }
-      by_filename : { "file.safetensors": ["loras/file.safetensors", ...] }
-    """
-    by_key      = {}
-    by_filename = defaultdict(list)
+    by_key      = {}                    # "loras/file.safetensors" -> Path
+    by_filename = defaultdict(list)     # "file.safetensors"       -> ["loras/file.safetensors"]
 
     if not models_dir.is_dir():
         return by_key, by_filename
@@ -86,7 +84,7 @@ def build_models_on_disk(models_dir: Path):
 
 
 def find_model_on_disk(raw, by_key, by_filename):
-    """Return canonical key (folder/file) or None."""
+    """Return canonical 'folder/filename' key or None."""
     norm = raw.replace("\\", "/").strip()
     if norm in by_key:
         return norm
@@ -103,78 +101,101 @@ def find_model_on_disk(raw, by_key, by_filename):
         return candidates[0]
     return None
 
+
 # ---------------------------------------------------------------------------
-# Extraction from one workflow
+# Extract model refs from one workflow JSON
 # ---------------------------------------------------------------------------
 
-def extract_refs(workflow, by_key, by_filename):
+def extract_refs(workflow, by_key, by_filename, debug=False, wf_label=""):
     """
-    Collect raw model filename strings from a workflow dict.
-    Three strategies, in priority order:
-
-      1. Top-level "models" array  (v1.0 schema, most explicit)
+    Three strategies in priority order:
+      1. Top-level "models" array  (v1.0 schema)
       2. widgets_values strings    (app/UI format — main source)
       3. Named "inputs" keys       (API/prompt format — fallback)
+
+    Returns list of raw model name strings.
     """
     found = []
     seen  = set()
 
-    def add(val):
+    def add(val, source):
         v = val.strip()
         if v and v not in seen:
             seen.add(v)
             found.append(v)
+            if debug:
+                print(f"      [+] {source}: {v!r}")
 
-    # ── Strategy 1: top-level "models" array (newer ComfyUI versions) ──────
+    # ── Strategy 1: top-level "models" array ────────────────────────────────
     for entry in workflow.get("models", []):
         if isinstance(entry, dict):
             name = entry.get("name", "")
             if name:
                 _, ext = os.path.splitext(name)
                 if ext.lower() in MODEL_EXTENSIONS:
-                    add(name)
+                    add(name, "models-array")
 
-    # ── Strategy 2: widgets_values (app/UI format — your saved workflows) ──
-    nodes_list = workflow.get("nodes", [])
-    if not nodes_list and "workflow" in workflow:
+    # ── Strategy 2: widgets_values (app/UI format) ──────────────────────────
+    # Locate the nodes list — handle both root-level and nested under "workflow"
+    nodes_list = []
+    if "nodes" in workflow:
+        nodes_list = workflow["nodes"]
+        if debug:
+            print(f"    nodes found at root level: {len(nodes_list)} node(s)")
+    elif "workflow" in workflow and isinstance(workflow["workflow"], dict):
         nodes_list = workflow["workflow"].get("nodes", [])
+        if debug:
+            print(f"    nodes found under 'workflow' key: {len(nodes_list)} node(s)")
+    else:
+        if debug:
+            print(f"    WARNING: no 'nodes' key found at root or under 'workflow'")
+            print(f"    Top-level keys: {list(workflow.keys())}")
 
     for node in nodes_list:
         if not isinstance(node, dict):
             continue
-        for item in node.get("widgets_values", []):
+        node_type = node.get("type", "unknown")
+        wv = node.get("widgets_values", [])
+        if not isinstance(wv, list):
+            continue
+        for item in wv:
             if not isinstance(item, str) or not item.strip():
                 continue
             item = item.strip()
-            # Accept if it matches something on disk OR has a model extension
             if find_model_on_disk(item, by_key, by_filename):
-                add(item)
+                add(item, f"widgets_values[{node_type}] matched-on-disk")
             else:
                 _, ext = os.path.splitext(item)
                 if ext.lower() in MODEL_EXTENSIONS:
-                    add(item)
+                    add(item, f"widgets_values[{node_type}] by-extension")
 
-    # ── Strategy 3: named inputs (API/prompt format) ────────────────────────
-    if isinstance(workflow, dict):
-        for node in workflow.values():
-            if not isinstance(node, dict):
-                continue
-            inputs = node.get("inputs", {})
-            if not isinstance(inputs, dict):
-                continue
-            for key, val in inputs.items():
-                if key in MODEL_KEYS and isinstance(val, str):
-                    _, ext = os.path.splitext(val)
-                    if ext.lower() in MODEL_EXTENSIONS:
-                        add(val)
+    # ── Strategy 3: named inputs (API/prompt format) ─────────────────────────
+    # Only look at values that are plain dicts with a "class_type" key,
+    # so we don't accidentally iterate the nodes list or other non-node values.
+    for val in workflow.values():
+        if not isinstance(val, dict):
+            continue
+        if "class_type" not in val:
+            continue
+        inputs = val.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        for key, v in inputs.items():
+            if key in MODEL_KEYS and isinstance(v, str):
+                _, ext = os.path.splitext(v)
+                if ext.lower() in MODEL_EXTENSIONS:
+                    add(v, f"inputs[{key}]")
 
     return found
+
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
+    debug = "--debug" in sys.argv
+
     root          = Path.cwd()
     workflows_dir = root / WORKFLOWS_DIR
     models_dir    = root / MODELS_DIR
@@ -191,6 +212,8 @@ def main():
 
     print(f"Workflows : {workflows_dir}")
     print(f"Models    : {models_dir}")
+    if debug:
+        print("  [debug mode on]")
 
     # ── Step 1: index disk ───────────────────────────────────────────────────
     print("\nScanning models folder …")
@@ -200,37 +223,40 @@ def main():
     # ── Step 2: read workflows ───────────────────────────────────────────────
     print("\nReading workflows …")
 
-    # usage_map: canonical_key -> set of workflow filenames
+    # usage_map: canonical_key -> set of workflow relative paths
     usage_map = defaultdict(set)
 
     workflow_files = list(workflows_dir.rglob("*.json"))
     print(f"  Found {len(workflow_files)} workflow file(s).")
 
     for wf_path in workflow_files:
-        wf_name = wf_path.name
+        # Store path relative to workflows_dir so subfolder is preserved,
+        # e.g. "subfolder/my_workflow.json" instead of just "my_workflow.json"
+        wf_label = wf_path.relative_to(workflows_dir).as_posix()
+
         try:
             with wf_path.open(encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception as exc:
-            print(f"  [WARN] Could not parse {wf_name}: {exc}")
+            print(f"  [WARN] Could not parse {wf_label}: {exc}")
             continue
 
-        refs = extract_refs(data, by_key, by_filename)
-        print(f"  {wf_name}: {len(refs)} model reference(s) found")
+        if debug:
+            print(f"\n  --- {wf_label} ---")
+
+        refs = extract_refs(data, by_key, by_filename, debug=debug, wf_label=wf_label)
+        print(f"  {wf_label}: {len(refs)} model reference(s) found")
 
         for raw in refs:
             matched = find_model_on_disk(raw, by_key, by_filename)
             if matched:
-                usage_map[matched].add(wf_name)
+                usage_map[matched].add(wf_label)
             else:
-                # Not on disk — store with a placeholder folder "unknown"
-                # unless the raw value already contains a slash
                 norm = raw.replace("\\", "/")
-                usage_map[norm].add(wf_name)
+                usage_map[norm].add(wf_label)
 
-    # ── Step 3: build workflow_models  { folder -> [ {filename, found, used_in} ] }
-    # Group by folder
-    folder_map = defaultdict(list)   # folder -> list of entry dicts
+    # ── Step 3: build workflow_models grouped by folder ──────────────────────
+    folder_map = defaultdict(list)
 
     for key, wf_set in usage_map.items():
         parts    = key.split("/")
@@ -242,13 +268,12 @@ def main():
             "used_in":  sorted(wf_set),
         })
 
-    # Sort entries inside each folder alphabetically
     workflow_models = {
         folder: sorted(entries, key=lambda e: e["filename"].lower())
         for folder, entries in sorted(folder_map.items())
     }
 
-    # ── Step 4: orphaned_models  { folder -> [filename, ...] }
+    # ── Step 4: orphaned_models grouped by folder ────────────────────────────
     used_keys = set(usage_map.keys())
 
     orphan_folder_map = defaultdict(list)
@@ -283,6 +308,8 @@ def main():
     print(f"  Orphaned model files       : {total_orp}")
     print(f"{'='*55}")
     print(f"\nReport written to: {output_file}")
+    if total_orp > 0 and not debug:
+        print("Tip: run with --debug to see exactly what each workflow yields.")
 
 
 if __name__ == "__main__":
