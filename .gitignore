@@ -1,2 +1,3 @@
 scan-unused-models/.DS_Store
 .DS_Store
+*.pyc

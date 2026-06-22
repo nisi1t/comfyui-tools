@@ -44,15 +44,6 @@ WORKFLOWS_DIR = Path("ComfyUI") / "user" / "default" / "workflows"
 MODELS_DIR    = Path("ComfyUI") / "models"
 OUTPUT_FILE   = Path("model_audit.json")
 
-MODEL_KEYS = {
-    "ckpt_name", "unet_name", "model_name", "vae_name",
-    "clip_name", "clip_name1", "clip_name2", "lora_name",
-    "control_net_name", "style_model_name", "gligen_textbox_model",
-    "upscale_model", "video_model", "audio_model",
-    "encoder_name", "decoder_name", "motion_module",
-    "ip_adapter_name", "ipadapter", "image_encoder", "embedding_name",
-}
-
 MODEL_EXTENSIONS = {
     ".safetensors", ".ckpt", ".pt", ".pth", ".bin",
     ".gguf", ".onnx", ".sft",
@@ -102,89 +93,81 @@ def find_model_on_disk(raw, by_key, by_filename):
     return None
 
 
+def iter_strings(obj):
+    """Yield every string value in a loaded workflow JSON object."""
+    stack = [obj]
+    seen = set()
+
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+        elif isinstance(current, str):
+            yield current
+
+
+def build_model_token_map(by_key):
+    token_map = defaultdict(set)
+
+    for disk_key in by_key:
+        parts = disk_key.split("/")
+        filename = parts[-1]
+        token_map[disk_key].add(disk_key)
+        token_map[filename].add(disk_key)
+
+        if len(parts) > 2:
+            token_map["/".join(parts[1:])].add(disk_key)
+
+    return token_map
+
+
 # ---------------------------------------------------------------------------
 # Extract model refs from one workflow JSON
 # ---------------------------------------------------------------------------
 
 def extract_refs(workflow, by_key, by_filename, debug=False, wf_label=""):
     """
-    Three strategies in priority order:
-      1. Top-level "models" array  (v1.0 schema)
-      2. widgets_values strings    (app/UI format — main source)
-      3. Named "inputs" keys       (API/prompt format — fallback)
+    Search every string in the workflow for models that exist on disk.
 
-    Returns list of raw model name strings.
+    This is intentionally node-type agnostic: if ComfyUI or a custom node stores
+    a model reference under a new key, the model is still counted as used when
+    its known filename/path appears anywhere in the workflow JSON.
     """
     found = []
     seen  = set()
+    token_map = build_model_token_map(by_key)
 
-    def add(val, source):
-        v = val.strip()
-        if v and v not in seen:
-            seen.add(v)
-            found.append(v)
+    def add(disk_key, source):
+        if disk_key not in seen:
+            seen.add(disk_key)
+            found.append(disk_key)
             if debug:
-                print(f"      [+] {source}: {v!r}")
+                print(f"      [+] {source}: {disk_key!r}")
 
-    # ── Strategy 1: top-level "models" array ────────────────────────────────
-    for entry in workflow.get("models", []):
-        if isinstance(entry, dict):
-            name = entry.get("name", "")
-            if name:
-                _, ext = os.path.splitext(name)
-                if ext.lower() in MODEL_EXTENSIONS:
-                    add(name, "models-array")
+    workflow_strings = list(iter_strings(workflow))
+    if debug:
+        print(f"    string values scanned: {len(workflow_strings)}")
 
-    # ── Strategy 2: widgets_values (app/UI format) ──────────────────────────
-    # Locate the nodes list — handle both root-level and nested under "workflow"
-    nodes_list = []
-    if "nodes" in workflow:
-        nodes_list = workflow["nodes"]
-        if debug:
-            print(f"    nodes found at root level: {len(nodes_list)} node(s)")
-    elif "workflow" in workflow and isinstance(workflow["workflow"], dict):
-        nodes_list = workflow["workflow"].get("nodes", [])
-        if debug:
-            print(f"    nodes found under 'workflow' key: {len(nodes_list)} node(s)")
-    else:
-        if debug:
-            print(f"    WARNING: no 'nodes' key found at root or under 'workflow'")
-            print(f"    Top-level keys: {list(workflow.keys())}")
+    for value in workflow_strings:
+        norm = value.replace("\\", "/").strip()
+        if not norm:
+            continue
 
-    for node in nodes_list:
-        if not isinstance(node, dict):
-            continue
-        node_type = node.get("type", "unknown")
-        wv = node.get("widgets_values", [])
-        if not isinstance(wv, list):
-            continue
-        for item in wv:
-            if not isinstance(item, str) or not item.strip():
-                continue
-            item = item.strip()
-            if find_model_on_disk(item, by_key, by_filename):
-                add(item, f"widgets_values[{node_type}] matched-on-disk")
-            else:
-                _, ext = os.path.splitext(item)
-                if ext.lower() in MODEL_EXTENSIONS:
-                    add(item, f"widgets_values[{node_type}] by-extension")
+        for disk_key in token_map.get(norm, []):
+            add(disk_key, "exact-string")
 
-    # ── Strategy 3: named inputs (API/prompt format) ─────────────────────────
-    # Only look at values that are plain dicts with a "class_type" key,
-    # so we don't accidentally iterate the nodes list or other non-node values.
-    for val in workflow.values():
-        if not isinstance(val, dict):
-            continue
-        if "class_type" not in val:
-            continue
-        inputs = val.get("inputs", {})
-        if not isinstance(inputs, dict):
-            continue
-        for key, v in inputs.items():
-            if key in MODEL_KEYS and isinstance(v, str):
-                _, ext = os.path.splitext(v)
-                if ext.lower() in MODEL_EXTENSIONS:
-                    add(v, f"inputs[{key}]")
+        basename = Path(norm).name
+        if basename != norm:
+            for disk_key in token_map.get(basename, []):
+                if norm == disk_key or norm.endswith("/" + disk_key):
+                    add(disk_key, "path-suffix")
 
     return found
 
